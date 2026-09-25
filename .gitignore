@@ -1,0 +1,51 @@
+# Byte-compiled / Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# Challenge Datasets & Raw Tabular Data (200MB+ files)
+dataset/
+ML_CHALLENGE/
+*.tsv
+*.csv
+*.parquet
+*.feather
+
+# Large Model Checkpoints & Pre-trained Weights
+*.pt
+*.pth
+*.bin
+*.onnx
+*.joblib
+*.pkl
+checkpoints/
+models/
+
+# Generated Outputs & Submission Archives
+output/
+*.zip
+*.tar.gz
+
+# IDE and Editor Configurations
+.vscode/
+.antigravity/
+.idea/
+*.swp
+*.swo
+
+# Operating System Files
+.DS_Store
+Thumbs.db
