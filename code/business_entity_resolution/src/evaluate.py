@@ -69,10 +69,13 @@ def find_optimal_threshold(
     y_true: np.ndarray,
     y_scores: np.ndarray,
     ground_truth_dict: Dict[str, Set[str]],
-    threshold_range: Tuple[float, float] = (0.50, 0.85),
-    step: float = 0.02,
+    threshold_range: Tuple[float, float] = (0.80, 0.92),
+    step: float = 0.01,
 ) -> Tuple[float, float, Dict[float, float]]:
     """Performs 1D grid search over decision thresholds to directly maximize macro F_0.5.
+
+    Decision boundaries tau in [0.80, 0.92] enforce heavy precision weighting (beta=0.5),
+    suppressing borderline candidate matches into true singletons.
 
     Returns:
         best_threshold: The threshold yielding highest macro F_0.5
@@ -86,7 +89,7 @@ def find_optimal_threshold(
             s1_candidates_map[s1_id] = []
         s1_candidates_map[s1_id].append((cand_id, float(score)))
 
-    best_threshold = 0.65
+    best_threshold = 0.85
     best_score = -1.0
     threshold_curve: Dict[float, float] = {}
 
@@ -108,3 +111,19 @@ def find_optimal_threshold(
             best_threshold = tau_float
 
     return best_threshold, best_score, threshold_curve
+
+
+def apply_threshold_cutoff(
+    cand_ids: List[str],
+    scores: List[float],
+    threshold: float,
+) -> List[str]:
+    """Applies high-precision threshold cutoff for an entity's candidate pool.
+
+    Suppresses noisy sub-threshold candidates into true singletons (empty list).
+    Returns deterministically sorted matching candidate IDs.
+    """
+    if not cand_ids or not scores:
+        return []
+    matched = [cid for cid, score in zip(cand_ids, scores) if score >= threshold]
+    return sorted(matched)

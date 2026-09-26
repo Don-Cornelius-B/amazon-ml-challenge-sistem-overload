@@ -45,12 +45,15 @@ RANDOM_SEED = 42
 # Blocking Hyperparameters (Memory-Bounded for <= 6.15 GB RAM)
 CHUNK_SIZE = 25000  # S1 streaming batch size
 DOT_SUBCHUNK_SIZE = 2000  # Sub-chunk dot product size to strictly bound sparse matrix allocation < 300 MB
-TOP_K_CANDIDATES = 10  # Max candidate matches per S1 entity
+TOP_K_CANDIDATES = 6  # Balances multi-match coverage across S2/S3 without candidate bloat
 TFIDF_MIN_SIM = 0.30  # Strict cosine similarity cutoff
 MAX_TFIDF_FEATURES = 40000  # Cap sparse dimension
 TFIDF_NGRAM_RANGE = (1, 2)  # Word n-grams (1, 2)
 MAX_DF = 0.03  # Prune terms appearing in > 3% of documents to prevent sparse allocation blowup
 MIN_DF = 3  # Prune rare noise terms
+
+# Deterministic Pre-Pass Parameters
+MAX_DETERMINISTIC_TARGETS = 10  # Max candidates bucket size per key to suppress noisy collisions
 
 # Training & Downsampling Parameters
 NEGATIVE_TO_POSITIVE_RATIO = 4  # 4:1 negative to positive candidate subsampling
@@ -67,5 +70,7 @@ LGBM_PARAMS = {
     "verbose": -1,
 }
 
-# Default conservative decision threshold for F_0.5 optimization
-DEFAULT_THRESHOLD = 0.65
+# High-precision decision threshold configuration strictly targeting Macro F_0.5
+DEFAULT_THRESHOLD = 0.85
+THRESHOLD_SWEEP_RANGE = (0.80, 0.92)
+THRESHOLD_SWEEP_STEP = 0.01

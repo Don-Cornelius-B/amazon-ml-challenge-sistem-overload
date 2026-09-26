@@ -154,13 +154,18 @@ def _process_pair_tuple(p):
     )
 
 def extract_features_batch(
-    pairs: List[Tuple[str, str, Set[str], str, str, str, Set[str], float]]
+    pairs: List[Tuple[str, str, Set[str], str, str, str, Set[str], float]],
+    n_jobs: int = 4,
 ) -> np.ndarray:
-    """Batch compute features for a list of (S1, Cand) pairs using joblib.Parallel."""
+    """Batch compute features for a list of (S1, Cand) pairs using joblib.Parallel with thread backend.
+
+    Using prefer="threads" bypasses Windows process serialization and pickling locks,
+    leveraging RapidFuzz's GIL-releasing C++ implementation for zero-overhead multi-core execution.
+    """
     if not pairs:
         return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
 
-    feats = Parallel(n_jobs=4, batch_size=2000)(
+    feats = Parallel(n_jobs=n_jobs, prefer="threads", batch_size=2000)(
         delayed(_process_pair_tuple)(p) for p in pairs
     )
     return np.array(feats, dtype=np.float32)

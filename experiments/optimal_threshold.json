@@ -1,5 +1,5 @@
 {
-  "optimal_threshold": 0.74,
+  "optimal_threshold": 0.85,
   "feature_names": [
     "name_ratio",
     "name_token_sort_ratio",

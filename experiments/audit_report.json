@@ -1,0 +1,23 @@
+{
+  "total_s1_entities": 2206821,
+  "true_singleton_count": 123247,
+  "true_singleton_pct": 5.5848,
+  "matched_entity_count": 2083574,
+  "matched_entity_pct": 94.4152,
+  "both_sources_pct": 85.2404,
+  "s2_only_pct": 6.8646,
+  "s3_only_pct": 7.895,
+  "avg_matches_per_matched_s1": 3.666,
+  "deterministic_prepass": {
+    "eval_sample_size": 10000,
+    "phone_resolved_entities": 4,
+    "phone_precision": 100.0,
+    "domain_resolved_entities": 0,
+    "domain_precision": 0.0,
+    "name_postal_resolved_entities": 302,
+    "name_postal_precision": 100.0,
+    "union_resolved_entities": 306,
+    "union_precision": 100.0,
+    "residual_ml_percentage": 96.94
+  }
+}

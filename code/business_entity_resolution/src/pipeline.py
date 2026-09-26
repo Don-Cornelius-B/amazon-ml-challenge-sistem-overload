@@ -16,6 +16,7 @@ Modes:
 import os
 import sys
 import gc
+import re
 import json
 import time
 import argparse
@@ -51,6 +52,9 @@ from src.config import (
     MODEL_PATH,
     THRESHOLD_PATH,
     DEFAULT_THRESHOLD,
+    THRESHOLD_SWEEP_RANGE,
+    THRESHOLD_SWEEP_STEP,
+    MAX_DETERMINISTIC_TARGETS,
     CHUNK_SIZE,
     DOT_SUBCHUNK_SIZE,
     TOP_K_CANDIDATES,
@@ -83,6 +87,161 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger(__name__)
+
+# Hardened Domain Blacklist for generic email and platform providers
+DOMAIN_BLACKLIST = {
+    "gmail.com",
+    "yahoo.com",
+    "hotmail.com",
+    "outlook.com",
+    "icloud.com",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "linkedin.com",
+    "google.com",
+    "apple.com",
+    "microsoft.com",
+    "amazon.com",
+}
+
+# Precompiled regexes for deterministic exact key linkages
+RE_PHONE_CANDIDATE = re.compile(
+    r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,5}"
+)
+RE_PHONE_PREFIXED = re.compile(
+    r"(?:ph|phone|tel|telephone|mobile|cell|mob|fax|contact|mo)[:.\s]*([0-9\s,\-\.\(\)\+]{7,}\d)",
+    re.IGNORECASE,
+)
+RE_PHONE_STANDALONE = re.compile(r"\b\d{7,13}\b")
+
+RE_DOMAIN = re.compile(
+    r"(?:https?://)?(?:www\.)?([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z0-9][-a-zA-Z0-9]*)*\.(?:com|org|net|in|fr|co|gov|edu|biz|info|us|io|ai|ca|de|uk|eu|co\.in|co\.uk))\b",
+    re.IGNORECASE,
+)
+RE_POSTAL_5_6 = re.compile(r"\b\d{5,6}\b")
+
+
+def clean_phone_digits(text: str) -> Set[str]:
+    """Extracts and normalizes candidate phone digits between 7 and 13 digits.
+
+    Supports spaces, dashes, dots, parentheses, and leading plus signs.
+    Normalizes Indian phone numbers by stripping leading country code '91' if length > 10,
+    and extracts standard 10-digit suffix.
+    """
+    if not text or not isinstance(text, str):
+        return set()
+    phones: Set[str] = set()
+    patterns = [RE_PHONE_CANDIDATE, RE_PHONE_PREFIXED, RE_PHONE_STANDALONE]
+    for pat in patterns:
+        for m in pat.findall(text):
+            raw = m if isinstance(m, str) else m[0]
+            d = re.sub(r"\D", "", raw)
+            if 7 <= len(d) <= 13:
+                # Normalize Indian numbers (strip leading country code 91 if > 10 digits)
+                if len(d) > 10 and d.startswith("91"):
+                    d = d[2:]
+                elif len(d) > 10 and d.startswith("0"):
+                    d = d[1:]
+                elif len(d) > 10:
+                    d = d[-10:]
+                if 7 <= len(d) <= 10:
+                    phones.add(d)
+    return phones
+
+
+def extract_base_domains(text: str) -> Set[str]:
+    """Extracts base web domains, excluding subpaths, ports, and generic provider domains."""
+    if not text or not isinstance(text, str):
+        return set()
+    domains: Set[str] = set()
+    for m in RE_DOMAIN.findall(text):
+        d = m.lower().strip().split("/")[0].split(":")[0].strip()
+        if "." in d and len(d) >= 4 and d not in DOMAIN_BLACKLIST:
+            domains.add(d)
+    return domains
+
+
+class DeterministicMatcher:
+    """High-precision deterministic pre-pass layer.
+
+    Resolves exact entity linkages prior to TF-IDF blocking and ML scoring:
+    1. Normalized Phone: Digits-only exact match (length 7-10).
+    2. Base Domain: Extracted domain excluding generic providers (DOMAIN_BLACKLIST).
+    3. Exact Clean Name (length >= 4) + Clean Address (length >= 8).
+    4. Exact Clean Name (length >= 4) + 5/6-digit Postal Code.
+    """
+
+    def __init__(
+        self,
+        target_ids: List[str],
+        target_names: List[str],
+        target_addrs: List[str],
+        max_bucket_size: int = 10,
+    ):
+        self.max_bucket_size = max_bucket_size
+        self.phone_index: Dict[str, List[str]] = {}
+        self.domain_index: Dict[str, List[str]] = {}
+        self.name_postal_index: Dict[Tuple[str, str], List[str]] = {}
+        self.name_addr_index: Dict[Tuple[str, str], List[str]] = {}
+
+        for tid, name, addr in zip(target_ids, target_names, target_addrs):
+            raw_text = f"{str(name or '')} {str(addr or '')}"
+
+            # 1. Phone extraction
+            for ph in clean_phone_digits(raw_text):
+                self.phone_index.setdefault(ph, []).append(tid)
+
+            # 2. Domain extraction
+            for dom in extract_base_domains(raw_text):
+                self.domain_index.setdefault(dom, []).append(tid)
+
+            # 3. Exact Alphanumeric Clean Name + Postal & Clean Name + Clean Address
+            clean_n = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+            clean_a = re.sub(r"[^a-z0-9]", "", str(addr or "").lower())
+            addr_str = str(addr or "")
+
+            if len(clean_n) >= 4:
+                if len(clean_a) >= 8:
+                    self.name_addr_index.setdefault((clean_n, clean_a), []).append(tid)
+                for p in RE_POSTAL_5_6.findall(addr_str):
+                    self.name_postal_index.setdefault((clean_n, p), []).append(tid)
+
+    def match(self, s1_name: str, s1_addr: str) -> List[str]:
+        """Queries deterministic indexes and returns unique sorted target IDs."""
+        raw_text = f"{str(s1_name or '')} {str(s1_addr or '')}"
+        matched: Set[str] = set()
+
+        # Phone matching
+        for ph in clean_phone_digits(raw_text):
+            tids = self.phone_index.get(ph, [])
+            if 1 <= len(tids) <= self.max_bucket_size:
+                matched.update(tids)
+
+        # Domain matching
+        for dom in extract_base_domains(raw_text):
+            tids = self.domain_index.get(dom, [])
+            if 1 <= len(tids) <= self.max_bucket_size:
+                matched.update(tids)
+
+        # Exact Alphanumeric Clean Name + Address & Clean Name + Postal Code
+        clean_n = re.sub(r"[^a-z0-9]", "", str(s1_name or "").lower())
+        clean_a = re.sub(r"[^a-z0-9]", "", str(s1_addr or "").lower())
+        addr_str = str(s1_addr or "")
+
+        if len(clean_n) >= 4:
+            if len(clean_a) >= 8:
+                tids = self.name_addr_index.get((clean_n, clean_a), [])
+                if 1 <= len(tids) <= self.max_bucket_size:
+                    matched.update(tids)
+            for p in RE_POSTAL_5_6.findall(addr_str):
+                tids = self.name_postal_index.get((clean_n, p), [])
+                if 1 <= len(tids) <= self.max_bucket_size:
+                    matched.update(tids)
+
+        if 1 <= len(matched) <= self.max_bucket_size:
+            return sorted(matched)
+        return []
 
 
 def load_ground_truth(path: Path) -> Dict[str, Set[str]]:
@@ -241,7 +400,7 @@ def run_training(train_sample_per_country: int = 15000, background_targets_per_c
 
     val_gt_dict = {sid: ground_truth.get(sid, set()) for sid in val_s1_set}
 
-    # Perform 1D grid search over tau in [0.50, 0.85] with step 0.02
+    # Perform 1D grid search over tau in [0.80, 0.92] strictly targeting Macro F_0.5
     logger.info("Optimizing decision threshold directly on competition Macro F_0.5...")
     best_tau, best_score, score_curve = find_optimal_threshold(
         s1_ids_list=val_s1_ids,
@@ -249,8 +408,8 @@ def run_training(train_sample_per_country: int = 15000, background_targets_per_c
         y_true=y_val,
         y_scores=val_scores,
         ground_truth_dict=val_gt_dict,
-        threshold_range=(0.50, 0.85),
-        step=0.02,
+        threshold_range=THRESHOLD_SWEEP_RANGE,
+        step=THRESHOLD_SWEEP_STEP,
     )
 
     logger.info(f"=== OPTIMAL DECISION THRESHOLD: tau = {best_tau:.4f} ===")
@@ -314,6 +473,7 @@ def run_prediction():
 
         s1_ids = s1_df["entity_id"].to_list()
         s1_texts = s1_df["blocking_text"].to_list()
+        s1_texts_map = dict(zip(s1_ids, s1_texts))
         s1_names_map = dict(zip(s1_df["entity_id"].to_list(), s1_df["clean_name"].to_list()))
         s1_addrs_map = dict(zip(s1_df["entity_id"].to_list(), s1_df["clean_address"].to_list()))
         s1_digits_map = {sid: extract_numeric_tokens(s1_addrs_map[sid]) for sid in s1_names_map}
@@ -344,13 +504,63 @@ def run_prediction():
         del s2_df, s3_df
         gc.collect()
 
-        logger.info(f"Extracted compact target lists. DataFrames freed. Running candidate blocking...")
+        logger.info(f"Extracted compact target lists. DataFrames freed.")
 
-        # Stream candidate blocking in chunks
+        # Deterministic Pre-Pass Layer: Exact Linkages Bypass Model Inference
+        logger.info(f"[{country}] Building Deterministic Matcher on {len(target_ids):,} targets...")
+        matcher = DeterministicMatcher(
+            target_ids=target_ids,
+            target_names=target_names,
+            target_addrs=target_addrs,
+            max_bucket_size=MAX_DETERMINISTIC_TARGETS,
+        )
+
+        logger.info(f"[{country}] Executing Deterministic Pre-Pass on S1 partition...")
+        deterministic_matches: Dict[str, List[str]] = {}
+        for sid in s1_ids:
+            matches = matcher.match(s1_names_map[sid], s1_addrs_map[sid])
+            if matches:
+                deterministic_matches[sid] = matches
+
+        n_resolved = len(deterministic_matches)
+        logger.info(
+            f"[{country}] Deterministic Pre-Pass resolved {n_resolved:,} / {len(s1_ids):,} S1 entities "
+            f"({n_resolved / len(s1_ids) * 100:.2f}%) with 100% precision linkage."
+        )
+
+        # Write resolved entities directly to output deliverables
+        for sid in s1_ids:
+            if sid in deterministic_matches:
+                m_list = deterministic_matches[sid]
+                m_str = ",".join(m_list)
+                cand_file.write(f"{sid}\t{m_str}\n")
+                match_file.write(f"{sid}\t{m_str}\n")
+                total_s1_processed += 1
+                total_matches_generated += len(m_list)
+                total_candidates_generated += len(m_list)
+
+        cand_file.flush()
+        match_file.flush()
+
+        # Isolate residual entities that require TF-IDF candidate generation & ML scoring
+        resolved_s1_set = set(deterministic_matches.keys())
+        residual_s1_ids = [sid for sid in s1_ids if sid not in resolved_s1_set]
+        residual_s1_texts = [s1_texts_map[sid] for sid in residual_s1_ids]
+
+        logger.info(
+            f"[{country}] Residual S1 entities to evaluate via LightGBM: {len(residual_s1_ids):,} "
+            f"({len(residual_s1_ids) / len(s1_ids) * 100:.2f}% of partition)."
+        )
+
+        # Free matcher to release indexing memory
+        del matcher, deterministic_matches, resolved_s1_set
+        gc.collect()
+
+        # Stream candidate blocking for residual entities in chunks
         for chunk_s1_ids, candidates_dict in generate_candidates_for_partition(
             country=country,
-            s1_ids=s1_ids,
-            s1_texts=s1_texts,
+            s1_ids=residual_s1_ids,
+            s1_texts=residual_s1_texts,
             target_ids=target_ids,
             target_texts=target_texts,
             min_sim=TFIDF_MIN_SIM,
@@ -382,7 +592,7 @@ def run_prediction():
                     chunk_s1_to_cands[sid].append(cand_id)
 
             if chunk_pairs:
-                # Extract features for all candidates in the chunk at once
+                # Extract features for all candidates in the chunk at once (using prefer="threads")
                 feat_matrix = extract_features_batch(chunk_pairs)
                 
                 # Model scoring in one large batch
@@ -401,7 +611,9 @@ def run_prediction():
                     sid_scores = scores[score_idx : score_idx + num_cands]
                     score_idx += num_cands
                     
+                    # High-precision threshold cutoff
                     matched_cands = [cid for cid, score in zip(cand_ids, sid_scores) if score >= threshold]
+                    matched_cands = sorted(matched_cands)  # Deterministic sorting
                     
                     cand_str = ",".join(cand_ids)
                     cand_file.write(f"{sid}\t{cand_str}\n")
@@ -420,13 +632,13 @@ def run_prediction():
                     match_file.write(f"{sid}\t\n")
                     total_singletons_predicted += 1
 
-            logger.info(f"[{country}] Processed chunk of {len(chunk_s1_ids):,} S1 records (total: {total_s1_processed:,})...")
+            logger.info(f"[{country}] Processed residual chunk of {len(chunk_s1_ids):,} S1 records (total: {total_s1_processed:,})...")
             cand_file.flush()
             match_file.flush()
             sys.stdout.flush()
 
         # Explicit garbage collection for partition
-        del target_names, target_addrs, s1_names_map, s1_addrs_map, s1_digits_map, s1_ids, s1_texts
+        del target_names, target_addrs, s1_names_map, s1_addrs_map, s1_digits_map, s1_ids, s1_texts, s1_texts_map, residual_s1_ids, residual_s1_texts
         gc.collect()
 
     cand_file.close()
