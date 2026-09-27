@@ -1,18 +1,4 @@
 {
-  "optimal_threshold": 0.85,
-  "feature_names": [
-    "name_ratio",
-    "name_token_sort_ratio",
-    "name_token_set_ratio",
-    "name_partial_ratio",
-    "name_prefix_match",
-    "name_length_diff",
-    "address_token_set_ratio",
-    "address_token_sort_ratio",
-    "address_numeric_jaccard",
-    "address_has_exact_digit_match",
-    "address_both_have_digits",
-    "tfidf_candidate_score",
-    "is_source2"
-  ]
+  "optimal_threshold": 0.80,
+  "metric": "macro_f0.5"
 }

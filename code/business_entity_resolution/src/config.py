@@ -71,6 +71,6 @@ LGBM_PARAMS = {
 }
 
 # High-precision decision threshold configuration strictly targeting Macro F_0.5
-DEFAULT_THRESHOLD = 0.85
+DEFAULT_THRESHOLD = 0.80
 THRESHOLD_SWEEP_RANGE = (0.80, 0.92)
 THRESHOLD_SWEEP_STEP = 0.01

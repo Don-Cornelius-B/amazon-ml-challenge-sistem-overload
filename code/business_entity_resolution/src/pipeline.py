@@ -105,6 +105,22 @@ DOMAIN_BLACKLIST = {
     "amazon.com",
 }
 
+# High-frequency generic commercial terms blacklisted from postal-only matching
+GENERIC_CHAINS = {
+    "subway",
+    "starbucks",
+    "mcdonalds",
+    "apollopharmacy",
+    "cafe",
+    "hotel",
+    "restaurant",
+    "store",
+    "pharmacy",
+    "bank",
+    "atm",
+    "supermarket",
+}
+
 # Precompiled regexes for deterministic exact key linkages
 RE_PHONE_CANDIDATE = re.compile(
     r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,5}"
@@ -123,13 +139,8 @@ RE_POSTAL_5_6 = re.compile(r"\b\d{5,6}\b")
 
 
 def clean_phone_digits(text: str) -> Set[str]:
-    """Extracts and normalizes candidate phone digits between 7 and 13 digits.
-
-    Supports spaces, dashes, dots, parentheses, and leading plus signs.
-    Normalizes Indian phone numbers by stripping leading country code '91' if length > 10,
-    and extracts standard 10-digit suffix.
-    """
-    if not text or not isinstance(text, str):
+    """Extracts genuine 9-10 digit telephone numbers only."""
+    if not text:
         return set()
     phones: Set[str] = set()
     patterns = [RE_PHONE_CANDIDATE, RE_PHONE_PREFIXED, RE_PHONE_STANDALONE]
@@ -137,16 +148,15 @@ def clean_phone_digits(text: str) -> Set[str]:
         for m in pat.findall(text):
             raw = m if isinstance(m, str) else m[0]
             d = re.sub(r"\D", "", raw)
-            if 7 <= len(d) <= 13:
-                # Normalize Indian numbers (strip leading country code 91 if > 10 digits)
-                if len(d) > 10 and d.startswith("91"):
-                    d = d[2:]
-                elif len(d) > 10 and d.startswith("0"):
-                    d = d[1:]
-                elif len(d) > 10:
-                    d = d[-10:]
-                if 7 <= len(d) <= 10:
-                    phones.add(d)
+            if len(d) > 10 and d.startswith("91"):
+                d = d[2:]
+            elif len(d) > 10 and d.startswith("0"):
+                d = d[1:]
+            elif len(d) > 10:
+                d = d[-10:]
+            # Strictly enforce 9 to 10 digits
+            if 9 <= len(d) <= 10:
+                phones.add(d)
     return phones
 
 
@@ -166,10 +176,10 @@ class DeterministicMatcher:
     """High-precision deterministic pre-pass layer.
 
     Resolves exact entity linkages prior to TF-IDF blocking and ML scoring:
-    1. Normalized Phone: Digits-only exact match (length 7-10).
+    1. Normalized Phone: Digits-only exact match (length 9-10).
     2. Base Domain: Extracted domain excluding generic providers (DOMAIN_BLACKLIST).
     3. Exact Clean Name (length >= 4) + Clean Address (length >= 8).
-    4. Exact Clean Name (length >= 4) + 5/6-digit Postal Code.
+    4. Chain-Safe Clean Name (length >= 6, excluding GENERIC_CHAINS) + 5/6-digit Postal Code.
     """
 
     def __init__(
@@ -201,9 +211,10 @@ class DeterministicMatcher:
             clean_a = re.sub(r"[^a-z0-9]", "", str(addr or "").lower())
             addr_str = str(addr or "")
 
-            if len(clean_n) >= 4:
-                if len(clean_a) >= 8:
-                    self.name_addr_index.setdefault((clean_n, clean_a), []).append(tid)
+            if len(clean_n) >= 4 and len(clean_a) >= 8:
+                self.name_addr_index.setdefault((clean_n, clean_a), []).append(tid)
+
+            if len(clean_n) >= 6 and clean_n not in GENERIC_CHAINS:
                 for p in RE_POSTAL_5_6.findall(addr_str):
                     self.name_postal_index.setdefault((clean_n, p), []).append(tid)
 
@@ -229,11 +240,12 @@ class DeterministicMatcher:
         clean_a = re.sub(r"[^a-z0-9]", "", str(s1_addr or "").lower())
         addr_str = str(s1_addr or "")
 
-        if len(clean_n) >= 4:
-            if len(clean_a) >= 8:
-                tids = self.name_addr_index.get((clean_n, clean_a), [])
-                if 1 <= len(tids) <= self.max_bucket_size:
-                    matched.update(tids)
+        if len(clean_n) >= 4 and len(clean_a) >= 8:
+            tids = self.name_addr_index.get((clean_n, clean_a), [])
+            if 1 <= len(tids) <= self.max_bucket_size:
+                matched.update(tids)
+
+        if len(clean_n) >= 6 and clean_n not in GENERIC_CHAINS:
             for p in RE_POSTAL_5_6.findall(addr_str):
                 tids = self.name_postal_index.get((clean_n, p), [])
                 if 1 <= len(tids) <= self.max_bucket_size:
@@ -242,6 +254,19 @@ class DeterministicMatcher:
         if 1 <= len(matched) <= self.max_bucket_size:
             return sorted(matched)
         return []
+
+    def match_partitioned(self, s1_name: str, s1_addr: str) -> Tuple[List[str], List[str]]:
+        """Returns separate match lists: (s2_matches, s3_matches)."""
+        raw_matches = self.match(s1_name, s1_addr)
+        s2_matches = [
+            m for m in raw_matches
+            if m.startswith("S2_") or m.startswith("S2-") or "_s2_" in m.lower() or "-s2-" in m.lower()
+        ]
+        s3_matches = [
+            m for m in raw_matches
+            if m.startswith("S3_") or m.startswith("S3-") or "_s3_" in m.lower() or "-s3-" in m.lower()
+        ]
+        return sorted(s2_matches), sorted(s3_matches)
 
 
 def load_ground_truth(path: Path) -> Dict[str, Set[str]]:
@@ -515,35 +540,44 @@ def run_prediction():
             max_bucket_size=MAX_DETERMINISTIC_TARGETS,
         )
 
-        logger.info(f"[{country}] Executing Deterministic Pre-Pass on S1 partition...")
-        deterministic_matches: Dict[str, List[str]] = {}
-        for sid in s1_ids:
-            matches = matcher.match(s1_names_map[sid], s1_addrs_map[sid])
-            if matches:
-                deterministic_matches[sid] = matches
+        logger.info(f"[{country}] Executing Partition-Aware Deterministic Pre-Pass on S1 partition...")
+        dual_deterministic_matches: Dict[str, List[str]] = {}
+        partial_deterministic_matches: Dict[str, List[str]] = {}
 
-        n_resolved = len(deterministic_matches)
+        for sid in s1_ids:
+            s2_det, s3_det = matcher.match_partitioned(s1_names_map[sid], s1_addrs_map[sid])
+            # Case A (Dual Deterministic Hit): If s2_det AND s3_det are both non-empty
+            if s2_det and s3_det:
+                all_matches = sorted(s2_det + s3_det)
+                dual_deterministic_matches[sid] = all_matches
+            # Case B (Partial Deterministic Hit): neither or only one source matched
+            elif s2_det or s3_det:
+                partial_deterministic_matches[sid] = sorted(s2_det + s3_det)
+
+        n_dual = len(dual_deterministic_matches)
+        n_partial = len(partial_deterministic_matches)
         logger.info(
-            f"[{country}] Deterministic Pre-Pass resolved {n_resolved:,} / {len(s1_ids):,} S1 entities "
-            f"({n_resolved / len(s1_ids) * 100:.2f}%) with 100% precision linkage."
+            f"[{country}] Deterministic Pre-Pass: {n_dual:,} dual hits (100% resolved), "
+            f"{n_partial:,} partial hits passed to ML scoring residual pool."
         )
 
-        # Write resolved entities directly to output deliverables
+        # Case A: Write dual-resolved entities directly to output deliverables
         for sid in s1_ids:
-            if sid in deterministic_matches:
-                m_list = deterministic_matches[sid]
-                m_str = ",".join(m_list)
-                cand_file.write(f"{sid}\t{m_str}\n")
-                match_file.write(f"{sid}\t{m_str}\n")
+            if sid in dual_deterministic_matches:
+                all_matches = dual_deterministic_matches[sid]
+                match_str = ",".join(all_matches)
+                cand_file.write(f"{sid}\t{match_str}\n")
+                match_file.write(f"{sid}\t{match_str}\n")
                 total_s1_processed += 1
-                total_matches_generated += len(m_list)
-                total_candidates_generated += len(m_list)
+                total_matches_generated += len(all_matches)
+                total_candidates_generated += len(all_matches)
 
         cand_file.flush()
         match_file.flush()
 
         # Isolate residual entities that require TF-IDF candidate generation & ML scoring
-        resolved_s1_set = set(deterministic_matches.keys())
+        # Case B (Partial or Zero Deterministic Hit): pass into residual pool
+        resolved_s1_set = set(dual_deterministic_matches.keys())
         residual_s1_ids = [sid for sid in s1_ids if sid not in resolved_s1_set]
         residual_s1_texts = [s1_texts_map[sid] for sid in residual_s1_ids]
 
@@ -553,7 +587,7 @@ def run_prediction():
         )
 
         # Free matcher to release indexing memory
-        del matcher, deterministic_matches, resolved_s1_set
+        del matcher, dual_deterministic_matches, resolved_s1_set
         gc.collect()
 
         # Stream candidate blocking for residual entities in chunks
@@ -601,36 +635,47 @@ def run_prediction():
                 score_idx = 0
                 for sid in chunk_s1_ids:
                     cand_ids = chunk_s1_to_cands[sid]
-                    if not cand_ids:
-                        cand_file.write(f"{sid}\t\n")
-                        match_file.write(f"{sid}\t\n")
-                        total_singletons_predicted += 1
-                        continue
-                        
                     num_cands = len(cand_ids)
                     sid_scores = scores[score_idx : score_idx + num_cands]
                     score_idx += num_cands
                     
                     # High-precision threshold cutoff
                     matched_cands = [cid for cid, score in zip(cand_ids, sid_scores) if score >= threshold]
-                    matched_cands = sorted(matched_cands)  # Deterministic sorting
                     
-                    cand_str = ",".join(cand_ids)
-                    cand_file.write(f"{sid}\t{cand_str}\n")
-                    total_candidates_generated += num_cands
+                    det_m = partial_deterministic_matches.get(sid, [])
+                    all_cands = sorted(set(det_m).union(cand_ids))
+                    all_matches = sorted(set(det_m).union(matched_cands))
                     
-                    if matched_cands:
-                        match_str = ",".join(matched_cands)
+                    if all_cands:
+                        cand_str = ",".join(all_cands)
+                        cand_file.write(f"{sid}\t{cand_str}\n")
+                        total_candidates_generated += len(all_cands)
+                    else:
+                        cand_file.write(f"{sid}\t\n")
+                    
+                    if all_matches:
+                        match_str = ",".join(all_matches)
                         match_file.write(f"{sid}\t{match_str}\n")
-                        total_matches_generated += len(matched_cands)
+                        total_matches_generated += len(all_matches)
                     else:
                         match_file.write(f"{sid}\t\n")
                         total_singletons_predicted += 1
             else:
                 for sid in chunk_s1_ids:
-                    cand_file.write(f"{sid}\t\n")
-                    match_file.write(f"{sid}\t\n")
-                    total_singletons_predicted += 1
+                    det_m = partial_deterministic_matches.get(sid, [])
+                    if det_m:
+                        all_cands = sorted(det_m)
+                        all_matches = sorted(det_m)
+                        cand_str = ",".join(all_cands)
+                        cand_file.write(f"{sid}\t{cand_str}\n")
+                        total_candidates_generated += len(all_cands)
+                        match_str = ",".join(all_matches)
+                        match_file.write(f"{sid}\t{match_str}\n")
+                        total_matches_generated += len(all_matches)
+                    else:
+                        cand_file.write(f"{sid}\t\n")
+                        match_file.write(f"{sid}\t\n")
+                        total_singletons_predicted += 1
 
             logger.info(f"[{country}] Processed residual chunk of {len(chunk_s1_ids):,} S1 records (total: {total_s1_processed:,})...")
             cand_file.flush()
@@ -638,7 +683,7 @@ def run_prediction():
             sys.stdout.flush()
 
         # Explicit garbage collection for partition
-        del target_names, target_addrs, s1_names_map, s1_addrs_map, s1_digits_map, s1_ids, s1_texts, s1_texts_map, residual_s1_ids, residual_s1_texts
+        del target_names, target_addrs, s1_names_map, s1_addrs_map, s1_digits_map, s1_ids, s1_texts, s1_texts_map, residual_s1_ids, residual_s1_texts, partial_deterministic_matches
         gc.collect()
 
     cand_file.close()
